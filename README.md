@@ -268,8 +268,10 @@ headroom xray optimize   # find waste patterns + paste-ready fixes
 ```
 
 Wraps [CodeBurn](https://github.com/getagentseal/codeburn) (MIT, 25+ agents) and
-adds a Headroom footer flagging compression opportunities by tool type. Requires
-Node 20+. See [docs/diagnosing-context-bloat.md](docs/diagnosing-context-bloat.md).
+adds a Headroom footer with the top tool-type token consumers for your current
+project's latest Claude Code session. Phase 1 reports raw counts; `headroom xray
+replay` (Phase 2) measures actual compression savings. Requires Node 20+. See
+[docs/diagnosing-context-bloat.md](docs/diagnosing-context-bloat.md).
 
 ## Contributing
 

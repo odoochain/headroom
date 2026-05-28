@@ -16,16 +16,21 @@ footer:
 
 ```
 ─────────────────────────────────────────────────────────────
-Headroom: top compression opportunities in this session
-  ▸ Bash outputs       53k tokens (24%)  — likely CCR-compressible
-  ▸ Read tool results  28k tokens (13%)  — ContentRouter target
-  ▸ MCP tool schemas    8k tokens  (4%)  — re-injected every turn
-  → Run `headroom xray replay` (coming soon) for exact savings.
+Headroom: top tool types by token usage
+  (claude-code · <session-id>.jsonl)
+  ▸ Bash                          53k tokens (24%)
+  ▸ Read                          28k tokens (13%)
+  ▸ mcp__codebase-memory-mcp...    8k tokens  (4%)
+  → `headroom xray replay` (Phase 2) measures actual compression savings.
 ─────────────────────────────────────────────────────────────
 ```
 
-The footer ranks the top-3 tool types by token usage and labels each with
-the Headroom compressor that would typically handle it.
+The footer ranks the top-3 tool-type token consumers in the project's
+latest Claude Code session. **Phase 1 reports raw counts only** — no
+compression claims, no "this looks compressible" guesses. Actual
+compressibility is measured by `headroom xray replay` (Phase 2), which
+runs Headroom's compressors over the transcript and reports per-block
+savings.
 
 ## Prerequisites
 
@@ -77,9 +82,14 @@ Pre-built binaries (cross-platform downloads à la RTK) arrive in Phase 1.1.
 - The Headroom footer parses **Claude Code** session JSONLs only. CodeBurn
   itself handles all 25+ agents for the dashboard; full-coverage footer
   arrives in Phase 2.
-- Footer hints are **labels**, not predictions. Phase 2 (`headroom xray
-  replay`) actually runs Headroom's compressors over the transcript and
-  reports counterfactual savings.
+- **The footer reports raw token counts only.** It makes no compression
+  claims and offers no per-block "this would save X%" estimates. Phase 2
+  (`headroom xray replay`) runs Headroom's actual compressors over the
+  transcript and reports per-block measured savings.
+- Footer scope is the **single latest Claude Code session** for your
+  current working directory. When CodeBurn ran a fleet/aggregate query
+  (`report`, `month`, `compare`, …), the footer adds an explicit
+  scope-mismatch caveat so the difference is obvious.
 
 ## Acknowledgments
 

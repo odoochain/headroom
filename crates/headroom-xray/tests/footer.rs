@@ -16,7 +16,7 @@ fn fixture_path() -> PathBuf {
 }
 
 #[test]
-fn footer_renders_top3_with_hints() {
+fn footer_renders_top3_counts_only() {
     let fixture = fixture_path();
     let t = claude_code::parse(&fixture).expect("parse");
     let counts = count_by_tool(&t).expect("count");
@@ -26,16 +26,19 @@ fn footer_renders_top3_with_hints() {
     };
     let rendered = footer::render(&counts, &ctx);
 
-    assert!(rendered.contains("compression opportunities in this project's latest session"));
+    assert!(rendered.contains("top tool types by token usage"));
     assert!(rendered.contains("claude_code_minimal.jsonl"));
     assert!(
         rendered.contains("Bash") || rendered.contains("Read"),
         "footer missing tool rows:\n{rendered}"
     );
-    assert!(rendered.contains("coming soon"));
+    assert!(rendered.contains("Phase 2"));
     assert!(rendered.contains("────"));
+    // No compression promises in Phase 1.
+    assert!(!rendered.contains("opportunities"));
+    assert!(!rendered.contains("CCR-compressible"));
     // Single-session view → no aggregate caveat.
-    assert!(!rendered.contains("Scope mismatch"));
+    assert!(!rendered.contains("spans many sessions"));
 }
 
 #[test]
@@ -48,7 +51,7 @@ fn aggregate_query_shows_scope_caveat() {
         aggregate_query: true,
     };
     let rendered = footer::render(&counts, &ctx);
-    assert!(rendered.contains("Scope mismatch"));
+    assert!(rendered.contains("spans many sessions"));
 }
 
 fn has_node() -> bool {
