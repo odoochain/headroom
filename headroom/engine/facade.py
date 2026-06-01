@@ -748,16 +748,15 @@ class HeadroomEngine:
                 # Conservative fallback for cache mode
                 optimized_messages = messages
 
-        # --- Tool sort (ALWAYS when tools present) ---
+        # --- Read tools (unsorted) ---
+        # The deterministic tool sort happens AFTER CCR injection (below), so the
+        # CCR retrieve tool is sorted IN with the client tools: sort(client + ccr).
+        # This matches the handler exactly (anthropic.py ~1638-1640) and is
+        # cache-optimal: tools are the FRONT of Anthropic's cache prefix
+        # (tools -> system -> messages), so ONE deterministic order over ALL tools
+        # (incl. ccr) maximizes reuse. Do NOT sort here then append ccr after —
+        # that special-cases ccr and diverges from the handler (the C1 cache-bust).
         tools = body.get("tools")
-        if tools is not None:
-            from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-
-            sorted_tools = AnthropicHandlerMixin._sort_tools_deterministically(tools)
-            if sorted_tools != tools:
-                body_mutation_tracker.mark_mutated("tool_sort")
-            body["tools"] = sorted_tools
-            tools = body["tools"]  # keep local alias in sync
 
         # ── CCR request-side (Chunk 4.2b) ────────────────────────────────────
         # Steps 1-4 are a no-op when ccr_components is None or CCR config flags
@@ -985,6 +984,16 @@ class HeadroomEngine:
         # --- Reassemble body ---
         body["messages"] = optimized_messages
 
+        # --- Tool sort (deterministic, ALWAYS when tools present) ---
+        # Runs AFTER CCR injection so the CCR retrieve tool is sorted IN with the
+        # client tools: sort(client + ccr). Mirrors the handler (anthropic.py
+        # ~1638-1640). No explicit mark_mutated here — the structural-diff
+        # safety-net below catches any reorder, exactly as the handler relies on.
+        if tools is not None:
+            from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+
+            body["tools"] = AnthropicHandlerMixin._sort_tools_deterministically(tools)
+
         # --- Structural mutation safety-net (mirrors handler lines ~1654-1660) ---
         if not body_mutation_tracker.mutated:
             try:
@@ -1126,9 +1135,13 @@ class HeadroomEngine:
 
                 working_messages = comp_cache.apply_cached(messages)
 
-                # Re-freeze boundary (mirrors handler lines ~1469-1470)
+                # Re-freeze boundary (mirrors the OpenAI handler ~line 1494).
+                # NOTE: the OpenAI handler does NOT call mark_stable_from_messages
+                # here — only the Anthropic handler does (anthropic.py ~1063).
+                # Calling it on the OpenAI path drifts the engine's compression-
+                # cache store from the handler's, so compute_frozen_count diverges
+                # on later turns → a multi-turn cache-bust. So we must NOT call it.
                 frozen_message_count = comp_cache.compute_frozen_count(messages)
-                comp_cache.mark_stable_from_messages(messages, frozen_message_count)
 
                 result = oc.pipeline.apply(
                     messages=working_messages,
