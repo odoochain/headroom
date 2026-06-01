@@ -1,4 +1,4 @@
-"""HeadroomEngine — request/response hook facade (Chunks 2 + 4.2a/4.2b/4.2c + 4.3-i + 5 + 5R).
+"""HeadroomEngine — request/response hook facade (Chunks 2 + 4.2a/4.2b/4.2c + 4.3-i + 5 + 5R + 5.2).
 
 Composes the existing compression subsystems behind a clean hook interface.
 Does NOT reimplement compression; delegates to injected ``CompressionPipeline``
@@ -54,6 +54,39 @@ Design notes
       ``stream_options`` before forwarding (unlike chat);
     * passthrough (no compression): returns raw inbound bytes byte-identical;
     * compressed: canonical re-serialization of the mutated body.
+- **Chunk 5.2 — OpenAI chat CCR + memory**: ``ccr_components`` and
+  ``memory_components`` are now wired into ``_on_request_openai_chat``.
+  Key differences from the Anthropic CCR/memory blocks:
+
+  CCR differences (mirrors ``OpenAIHandlerMixin.handle_openai_chat`` lines
+  ~1593-1629):
+    * ``CCRToolInjector(provider="openai", ...)`` — OpenAI message shapes.
+    * NO ``frozen_message_count`` guard on system-instruction injection or tool
+      injection — the live OpenAI handler does not apply those guards.
+    * NO compression tracking (step 3) or proactive expansion (step 4) — the
+      live OpenAI handler omits those CCR phases entirely.
+    * Tools updated in ``body["tools"]`` after CCR injection (same as handler
+      at lines ~1755-1756).
+
+  Memory differences (mirrors lines ~1643-1733):
+    * Uses ``append_text_to_latest_user_chat_message`` (OpenAI helper that
+      scans backwards ignoring frozen count) instead of the Anthropic frozen-
+      aware helper.
+    * Does NOT skip injection in cache mode (the OpenAI handler injects in all
+      modes).
+    * When CCR components is None but memory components is set, memory injection
+      still fires (the two are independent gates).
+
+  Responses + CCR/memory:
+    The live ``handle_openai_responses`` handler does run memory injection
+    (into ``body["input"]``) BEFORE compression.  The engine's
+    ``_on_request_openai_responses`` currently does not wire CCR or memory
+    (the golden corpus has both features off and the handler position is
+    pre-compression rather than post-compression).  This is intentional: the
+    Responses path does not expose ``messages`` to the engine after the
+    compression step, and wiring it pre-compression would require restructuring
+    the responses path.  Memory for Responses is deferred; the omission is
+    documented here and in the method docstring.
 """
 
 from __future__ import annotations
@@ -980,14 +1013,16 @@ class HeadroomEngine:
             ),
         )
 
-    # ── Real OpenAI chat orchestration (Chunk 5) ─────────────────────────────
+    # ── Real OpenAI chat orchestration (Chunk 5 + 5.2) ──────────────────────
 
     def _on_request_openai_chat(self, ctx: RequestContext) -> RequestDecision:
         """Reproduce the OpenAI /v1/chat/completions compression-core.
 
         Mirrors ``OpenAIHandlerMixin.handle_openai_chat`` through:
-          CompressionDecision → mode-branch pipeline.apply → (streaming:
-          inject stream_options) → canonical serialization.
+          CompressionDecision → mode-branch pipeline.apply → CCR marker-scan +
+          tool-inject (when ccr_components set, not bypass) → memory inject
+          (when memory_components set, not bypass) → (streaming: inject
+          stream_options) → canonical serialization.
 
         Intentional differences from the Anthropic path that are faithfully
         preserved here to match the live handler byte-for-byte:
@@ -1008,11 +1043,21 @@ class HeadroomEngine:
            BEFORE forwarding the bytes.  This produces a byte-level difference
            vs the inbound body and is captured in the streaming golden fixtures.
 
-        Excluded from this chunk: CCR injection, memory injection, hooks,
-        pipeline_extension events, prefix-tracker.update_from_response,
-        cache, rate-limiting, image compression.  These are all controlled OFF
-        in the golden recorder's ``_DEFAULT_CONFIG_KWARGS``, so the 16 chat
-        golden fixtures do not exercise them.
+        4. **CCR differences from Anthropic** (Chunk 5.2):
+           - ``CCRToolInjector(provider="openai", ...)`` — OpenAI shapes.
+           - NO ``frozen_message_count`` guard on system-instruction or tool
+             injection (handler lines 1603-1629 have no such guard).
+           - NO compression tracking or proactive expansion — the live OpenAI
+             handler omits CCR phases 3 and 4 entirely.
+
+        5. **Memory differences from Anthropic** (Chunk 5.2):
+           - Uses ``append_text_to_latest_user_chat_message`` (OpenAI helper
+             that scans backwards without frozen-count awareness).
+           - Does NOT skip in cache mode (the handler injects in all modes).
+
+        When ``ccr_components`` or ``memory_components`` is None, those steps
+        are a no-op — all 22 existing golden fixtures (CCR/memory off) remain
+        byte-identical.
         """
         from headroom.proxy.helpers import serialize_body_canonical
         from headroom.proxy.modes import is_cache_mode, is_token_mode
@@ -1053,6 +1098,11 @@ class HeadroomEngine:
         )
 
         optimized_messages = messages
+        # session_id is derived once (outside the compress block) so CCR can
+        # use it even when compression was skipped (sticky tool logic needs it).
+        session_id: str | None = None
+        frozen_message_count = 0
+        request_id = ctx.request_id
 
         if _decision.should_compress and not _bypass:
             # --- Session / frozen-count derivation ---
@@ -1068,9 +1118,9 @@ class HeadroomEngine:
             context_limit = oc.provider.get_context_limit(model)
 
             biases = None
-            request_id = ctx.request_id
 
             # --- Mode branch: token / non-cache / cache-delta ---
+            assert session_id is not None  # set 3 lines above; mypy flow narrowing
             if is_token_mode(oc.config.mode):
                 comp_cache = oc.get_compression_cache(session_id)
 
@@ -1111,8 +1161,105 @@ class HeadroomEngine:
                 if result.messages != messages:
                     optimized_messages = result.messages
 
+        # ── CCR request-side (Chunk 5.2 — OpenAI) ────────────────────────────
+        # Mirrors ``handle_openai_chat`` lines ~1593-1629.
+        # Steps wired: marker scan + system-instruction injection +
+        # session-sticky tool injection.
+        # NOT wired: compression tracking (step 3) + proactive expansion
+        # (step 4) — the live OpenAI handler does not implement those phases.
+        # Gate: ccr_components not None AND not bypass (same as handler).
+        ccr = self._ccr_components
+        tools = body.get("tools")
+        ccr_tool_injected = False
+
+        if ccr is not None and not _bypass:
+            # Derive session_id for sticky-tool registration even when
+            # compression was skipped (_decision.should_compress=False).
+            if session_id is None:
+                session_id = oc.session_tracker_store.compute_session_id(ctx, model, messages)
+
+            if oc.config.ccr_inject_tool or oc.config.ccr_inject_system_instructions:
+                from headroom.ccr import CCRToolInjector
+                from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                injector = CCRToolInjector(
+                    provider="openai",
+                    inject_tool=False,  # routed through sticky helper below
+                    inject_system_instructions=oc.config.ccr_inject_system_instructions,
+                )
+                injector.scan_for_markers(optimized_messages)
+
+                # System-instruction injection — NO frozen guard (handler
+                # line 1611 has no such guard for OpenAI).
+                if oc.config.ccr_inject_system_instructions and injector.has_compressed_content:
+                    optimized_messages = injector.inject_into_system_message(optimized_messages)
+
+                if oc.config.ccr_inject_tool:
+                    tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                        provider="openai",
+                        session_id=session_id,
+                        request_id=request_id,
+                        existing_tools=tools,
+                        has_compressed_content_this_turn=injector.has_compressed_content,
+                    )
+                    if ccr_tool_injected:
+                        logger.debug(
+                            "[%s] CCR(engine/openai): tool registered (session=%s, "
+                            "compressed_this_turn=%s, hashes_seen=%d)",
+                            request_id,
+                            session_id,
+                            injector.has_compressed_content,
+                            len(injector.detected_hashes),
+                        )
+
+        # ── Memory injection (Chunk 5.2 — OpenAI) ────────────────────────────
+        # Mirrors ``handle_openai_chat`` lines ~1643-1733.
+        # Uses ``append_text_to_latest_user_chat_message`` (OpenAI helper)
+        # which scans backwards through all messages without frozen-count
+        # awareness — the live handler does not apply a frozen guard here.
+        # Does NOT skip in cache mode (handler injects in all modes).
+        # Gate: memory_components not None AND not bypass.
+        mc = self._memory_components
+        if mc is not None and not _bypass:
+            from headroom.proxy.helpers import get_memory_injection_mode
+            from headroom.proxy.memory_decision import MemoryDecision
+
+            _header_user_id = headers.get("x-headroom-user-id", "")
+            memory_user_id: str | None = _header_user_id if _header_user_id else mc.default_user_id
+
+            mem_decision = MemoryDecision.decide(
+                headers=ctx.headers_view,
+                memory_handler=mc.memory_handler,
+                memory_user_id=memory_user_id,
+                mode_name=get_memory_injection_mode(),
+            )
+            if mem_decision.inject:
+                _inject_ctx = mc.memory_handler is not None and getattr(
+                    getattr(mc.memory_handler, "config", None), "inject_context", True
+                )
+                if _inject_ctx:
+                    memory_context: str | None = ctx.prefetched_memory_context
+                    if memory_context:
+                        from headroom.proxy.helpers import (
+                            append_text_to_latest_user_chat_message,
+                        )
+
+                        new_messages, bytes_appended = append_text_to_latest_user_chat_message(
+                            optimized_messages, memory_context
+                        )
+                        if bytes_appended > 0:
+                            optimized_messages = new_messages
+                            logger.debug(
+                                "[%s] Memory(engine/openai): injected %d bytes into "
+                                "latest user message tail",
+                                request_id,
+                                bytes_appended,
+                            )
+
         # --- Reassemble body ---
         body["messages"] = optimized_messages
+        if tools is not None:
+            body["tools"] = tools
 
         # --- Streaming: inject stream_options (mirrors handler lines ~2026-2029) ---
         # The live handler injects this BEFORE forwarding bytes, so it appears in the
@@ -1138,6 +1285,7 @@ class HeadroomEngine:
             telemetry=ResponseTelemetry(
                 bytes_saved=bytes_saved,
                 compressed=compressed,
+                ccr_fired=ccr_tool_injected,
             ),
         )
 
@@ -1178,6 +1326,17 @@ class HeadroomEngine:
         Excluded: memory injection, CCR, beta-header sticky merge, image
         compression, hooks — all off in the golden corpus's
         ``_DEFAULT_CONFIG_KWARGS``.
+
+        Memory / CCR for Responses (intentionally deferred):
+        The live ``handle_openai_responses`` handler runs memory injection
+        into ``body["input"]`` BEFORE compression, using
+        ``append_text_to_latest_user_input_item``.  Wiring it here would
+        require restructuring the engine to expose ``body["input"]`` after
+        the ``_compress_openai_responses_payload`` step (the compressor
+        already returns the mutated body dict).  This is deferred; when
+        wired it should run AFTER compression (mirrors the chat path) and
+        use the same ``append_text_to_latest_user_input_item`` helper.
+        The 6 golden Responses fixtures are not affected (memory/CCR off).
         """
         from headroom.proxy.helpers import serialize_body_canonical
 
