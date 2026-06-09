@@ -113,9 +113,12 @@ def _load_tokenizer(tokenizer_name: str):
     Returns:
         Loaded tokenizer, or None if unavailable.
     """
-    from transformers import AutoTokenizer
-
     try:
+        # Import inside try so a missing `transformers` (ImportError) degrades
+        # gracefully to char-based estimation via _use_fallback, instead of
+        # crashing the request with ModuleNotFoundError.
+        from transformers import AutoTokenizer
+
         return AutoTokenizer.from_pretrained(
             tokenizer_name,
             trust_remote_code=True,
